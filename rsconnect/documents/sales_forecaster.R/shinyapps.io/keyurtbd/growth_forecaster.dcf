@@ -1,0 +1,10 @@
+name: growth_forecaster
+title: Growth Forecaster
+username: keyurtbd
+account: keyurtbd
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 18322507
+bundleId: 12758885
+url: https://keyurtbd.shinyapps.io/growth_forecaster/
+version: 1
