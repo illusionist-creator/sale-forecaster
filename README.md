@@ -20,12 +20,33 @@ on the Data tab for the upload format.
 |---|---|
 | `sales_forecaster.R` | UI and server wiring (deployed to shinyapps.io as the primary document) |
 | `R/engine.R` | All finance and forecasting logic, as pure functions with no Shiny dependency |
-| `tests/test_engine.R` | Engine tests: `Rscript tests/test_engine.R` from the project root |
+| `R/storage.R` | Saved plan versions (SQLite locally, Postgres in production) |
+| `tests/` | `Rscript tests/test_engine.R` and `Rscript tests/test_storage.R` from the project root |
+| `Dockerfile`, `docker-compose.yml`, `deploy/` | Self-hosted production setup |
+| `.github/workflows/ci.yml` | Builds the image and runs all tests (including against Postgres) on every push |
+
+## Saved versions
+
+The **Versions** tab saves the current plan (data, assumptions, monthly plan, method, horizon,
+GST basis, scenario levers) as an immutable snapshot with a name, notes and a status
+(Draft, In review, Approved, Archived). Versions can be reloaded exactly or compared by fiscal
+year. Approved versions are locked against deletion, and each version records who saved it.
+
+Storage defaults to a SQLite file at `data/forecaster.sqlite`. Set `GF_DB=postgres` plus the
+standard `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and `PGPASSWORD` variables to use Postgres.
+
+## Deployment
+
+- **Production:** Docker on your own server, with HTTPS, a login prompt, Postgres and nightly backups.
+  Step-by-step guide: [deploy/DEPLOY.md](deploy/DEPLOY.md).
+- **shinyapps.io:** still works for demos, but its file system resets on every restart, so saved
+  versions are temporary there (the app shows a warning). Redeploying needs `RSQLite` and `RPostgres`
+  installed locally.
 
 ## Packages
 
 shiny, bslib, bsicons, DT, plotly, rhandsontable, readxl, writexl, openxlsx, dplyr, tidyr,
-lubridate, forecast.
+lubridate, forecast, DBI, RSQLite, RPostgres, jsonlite.
 
 ## Key modelling choices
 

@@ -1,0 +1,52 @@
+# Builds the production Docker image, runs every test inside it (storage
+# tests against both SQLite and a real Postgres), and checks the app boots.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: forecaster
+          POSTGRES_USER: forecaster
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forecaster"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t growth-forecaster .
+
+      - name: Engine tests
+        run: docker run --rm -v "$PWD:/src" -w /src growth-forecaster Rscript tests/test_engine.R
+
+      - name: Storage tests (SQLite)
+        run: docker run --rm -v "$PWD:/src" -w /src growth-forecaster Rscript tests/test_storage.R
+
+      - name: Storage tests (Postgres)
+        run: >-
+          docker run --rm --network host -v "$PWD:/src" -w /src
+          -e GF_DB=postgres -e PGHOST=localhost -e PGPORT=5432
+          -e PGDATABASE=forecaster -e PGUSER=forecaster -e PGPASSWORD=ci-only
+          growth-forecaster Rscript tests/test_storage.R
+
+      - name: App starts and serves HTTP
+        run: |
+          docker run -d --name app -p 3838:3838 growth-forecaster
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3838/ > /dev/null; then echo "App is up"; exit 0; fi
+            sleep 2
+          done
+          docker logs app
+          exit 1

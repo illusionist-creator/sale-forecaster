@@ -1,0 +1,54 @@
+# Production stack: app + Postgres + Caddy (automatic HTTPS and a login prompt).
+# Configure via .env (copy .env.example). See deploy/DEPLOY.md.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      GF_DB: postgres
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: forecaster
+      PGUSER: forecaster
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      GF_TZ: ${GF_TZ:-Asia/Kolkata}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: forecaster
+      POSTGRES_USER: forecaster
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forecaster -d forecaster"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER in .env}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:?set BASIC_AUTH_HASH in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

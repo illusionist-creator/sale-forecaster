@@ -1,0 +1,14 @@
+# HTTPS certificate is issued automatically for $DOMAIN (DNS must point here).
+{$DOMAIN} {
+	encode gzip
+
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+
+	# Shiny needs websockets, which reverse_proxy passes through. The signed-in
+	# user name is forwarded so saved versions record who created them.
+	reverse_proxy app:3838 {
+		header_up X-Forwarded-User {http.auth.user.id}
+	}
+}

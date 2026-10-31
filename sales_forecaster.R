@@ -18,6 +18,10 @@ library(lubridate)
 library(forecast)
 
 source(file.path("R", "engine.R"), local = TRUE)
+source(file.path("R", "storage.R"), local = TRUE)
+
+# One database connection shared by all sessions; connects lazily on first use.
+store <- new_store()
 
 # ---- Presentation constants ----------------------------------------------------
 
@@ -374,6 +378,39 @@ ui <- page_navbar(
   ),
 
   nav_panel(
+    "Versions", value = "versions", icon = bs_icon("clock-history"),
+    uiOutput("storage_note"),
+    layout_columns(
+      col_widths = c(3, 9),
+      card(
+        card_header("Save current plan"),
+        card_body(
+          textInput("version_name", "Version name", placeholder = "e.g. FY27 Budget v1"),
+          textAreaInput("version_notes", "Notes", rows = 3, placeholder = "What changed, key assumptions, who asked for it"),
+          selectInput("version_status", "Status", VERSION_STATUSES, selected = "Draft"),
+          actionButton("save_version", "Save version", icon = icon("floppy-disk"), class = "btn-primary w-100"),
+          tags$small(class = "text-muted d-block mt-2",
+                     "Saves the data, assumptions, monthly plan, method, horizon, GST basis and scenario levers ",
+                     "exactly as they are now. Saved versions never change; save again to record a new one.")
+        )
+      ),
+      card(
+        card_header("Saved versions", tags$small(class = "text-muted ms-2", "select one to load, two or more to compare")),
+        card_body(
+          div(class = "d-flex flex-wrap gap-2 mb-2 align-items-end",
+              actionButton("load_version", "Load", icon = icon("folder-open"), class = "btn-primary btn-sm"),
+              div(class = "d-flex gap-1 align-items-end",
+                  selectInput("new_status", NULL, VERSION_STATUSES, width = "140px"),
+                  actionButton("apply_status", "Set status", class = "btn-outline-secondary btn-sm mb-3")),
+              actionButton("delete_version", "Delete", icon = icon("trash"), class = "btn-outline-danger btn-sm")),
+          DTOutput("versions_table", fill = FALSE)
+        )
+      )
+    ),
+    uiOutput("version_compare")
+  ),
+
+  nav_panel(
     "Methodology", value = "method", icon = bs_icon("book"),
     card(card_body(
       h4("How the numbers are built"),
@@ -424,8 +461,11 @@ server <- function(input, output, session) {
   state <- reactiveValues(
     clean = NULL, source = NULL, issues = NULL,
     plan = NULL, plan_name = NULL, plan_issues = NULL,
-    assumptions = NULL, assumptions_rev = 0
+    assumptions = NULL, assumptions_rev = 0,
+    version = NULL
   )
+  versions_rev <- reactiveVal(0)
+  current_user <- session$user %||% session$request$HTTP_X_FORWARDED_USER %||% "anonymous"
   model_cache <- new.env()
 
   # ---- Loading -------------------------------------------------------------------
@@ -438,6 +478,28 @@ server <- function(input, output, session) {
     }
   }
 
+  # Install a validated dataset and reset everything derived from it.
+  # Returns the monthly consolidation so callers can build assumptions.
+  apply_dataset <- function(clean, issues, source_name, gst_mode = input$gst_mode, horizon = NULL) {
+    rm(list = ls(model_cache), envir = model_cache)
+    state$clean <- clean
+    state$issues <- issues
+    state$source <- source_name
+    state$plan <- NULL
+    state$plan_name <- NULL
+    state$plan_issues <- NULL
+    state$version <- NULL
+
+    m <- consolidate_monthly(clean, gst_mode)
+    for (id in c("f_partner", "f_category", "horizon")) freezeReactiveValue(input, id)
+    updateSelectizeInput(session, "f_partner", choices = sort(unique(m$Partner_Category)), selected = character(0))
+    updateSelectizeInput(session, "f_category", choices = sort(unique(m$Category)), selected = character(0))
+    hc <- horizon_choices(max(m$Date) %m+% months(1))
+    updateSelectInput(session, "horizon", choices = hc,
+                      selected = if (!is.null(horizon) && horizon %in% hc) horizon else hc[2])
+    m
+  }
+
   load_actuals <- function(raw, source_name) {
     res <- validate_actuals(raw)
     state$issues <- res$issues
@@ -445,23 +507,9 @@ server <- function(input, output, session) {
       showNotification("The file failed validation. See the data quality report.", type = "error", duration = 8)
       return(invisible(FALSE))
     }
-    rm(list = ls(model_cache), envir = model_cache)
-    state$clean <- res$data
-    state$source <- source_name
-    state$plan <- NULL
-    state$plan_name <- NULL
-    state$plan_issues <- NULL
-
-    m <- consolidate_monthly(res$data, input$gst_mode)
+    m <- apply_dataset(res$data, res$issues, source_name)
     state$assumptions <- default_assumptions(m)
     state$assumptions_rev <- state$assumptions_rev + 1
-
-    for (id in c("f_partner", "f_category", "horizon")) freezeReactiveValue(input, id)
-    updateSelectizeInput(session, "f_partner", choices = sort(unique(m$Partner_Category)), selected = character(0))
-    updateSelectizeInput(session, "f_category", choices = sort(unique(m$Category)), selected = character(0))
-    hc <- horizon_choices(max(m$Date) %m+% months(1))
-    updateSelectInput(session, "horizon", choices = hc, selected = hc[2])
-
     showNotification(sprintf("Loaded %s: %d series, actuals to %s.", source_name,
                              nrow(state$assumptions), format(max(m$Date), "%b-%Y")), type = "message")
     invisible(TRUE)
@@ -571,7 +619,11 @@ server <- function(input, output, session) {
         div(tags$span(class = "label", "Latest actual: "), tags$b(format(last_actual(), "%b-%Y"))),
         div(tags$span(class = "label", "Series: "), tags$b(nrow(state$assumptions))),
         div(tags$span(class = "label", "Forecast: "), tags$b(window_label())),
-        if (!is.null(state$plan)) div(bs_icon("calendar-check"), " Monthly plan active"))
+        if (!is.null(state$plan)) div(bs_icon("calendar-check"), " Monthly plan active"),
+        if (!is.null(state$version)) {
+          div(bs_icon("clock-history"), " Based on ", tags$b(state$version$name),
+              tags$span(class = "text-muted", sprintf(" (%s)", state$version$status)))
+        })
   })
 
   # ---- Overview ----------------------------------------------------------------------
@@ -862,16 +914,17 @@ server <- function(input, output, session) {
 
   # ---- Scenarios tab ----------------------------------------------------------------------
 
-  observeEvent(input$reset_levers, {
+  set_lever_inputs <- function(all_levers) {
     for (prefix in c("up", "down")) {
-      d <- SCENARIO_DEFAULTS[[if (prefix == "up") "Upside" else "Downside"]]
+      d <- all_levers[[if (prefix == "up") "Upside" else "Downside"]]
       updateNumericInput(session, paste0(prefix, "_volume"), value = 100 * d$volume)
       updateNumericInput(session, paste0(prefix, "_price"), value = 100 * d$price)
       updateNumericInput(session, paste0(prefix, "_cost"), value = 100 * d$cost)
       updateNumericInput(session, paste0(prefix, "_commission"), value = 100 * d$commission_pp)
       updateNumericInput(session, paste0(prefix, "_returns"), value = 100 * d$returns_pp)
     }
-  })
+  }
+  observeEvent(input$reset_levers, set_lever_inputs(SCENARIO_DEFAULTS))
 
   output$scenario_table <- renderDT({
     need_data()
@@ -978,6 +1031,10 @@ server <- function(input, output, session) {
     filters <- c(if (length(input$f_partner)) paste("Partners:", paste(input$f_partner, collapse = ", ")),
                  if (length(input$f_category)) paste("Categories:", paste(input$f_category, collapse = ", ")))
     c("Prepared on" = format(Sys.time(), "%d %b %Y %H:%M"),
+      "Plan version" = if (is.null(state$version)) "Unsaved working copy" else {
+        if (identical(state$version$status, "Approved")) paste0(state$version$name, " (Approved)")
+        else paste0(state$version$name, " (", state$version$status, "; edits after loading are not saved)")
+      },
       "Data source" = state$source,
       "Latest actual month" = format(last_actual(), "%b-%Y"),
       "Forecast period" = window_label(),
@@ -1108,6 +1165,240 @@ server <- function(input, output, session) {
                            name = method_label(m), line = list(color = SERIES[match(m, METHODS)], width = 2, dash = "dash"))
     }
     p %>% style_plot(y_title = "Units") %>% layout(xaxis = list(hoverformat = "%b %Y"))
+  })
+
+  # ---- Versions ------------------------------------------------------------------------------
+
+  output$storage_note <- renderUI({
+    if (store_is_ephemeral()) {
+      div(class = "alert alert-warning d-flex gap-2 align-items-start", bs_icon("exclamation-triangle"),
+          div(tags$b("Saved versions are temporary on shinyapps.io. "),
+              "Its file system is reset whenever the app restarts or is redeployed. ",
+              "Use the Docker deployment (deploy/DEPLOY.md) for permanent storage."))
+    } else {
+      p(class = "text-muted small", bs_icon("database"), " Versions are stored in ", store_description(), ".")
+    }
+  })
+
+  # Whole-portfolio FY totals per scenario (sidebar filters ignored: a version is the full plan).
+  fy_summary <- function() {
+    bind_rows(lapply(names(scenario_frames()), function(s) {
+      bind_rows(actuals(), scenario_frames()[[s]]) %>%
+        mutate(Period = period_start(Date, "year")) %>%
+        group_by(Period) %>%
+        summarise(Net_Sales = sum(Net_Sales), GM = sum(GM),
+                  Basis = paste(sort(unique(substr(Type, 1, 1))), collapse = "+"), .groups = "drop") %>%
+        mutate(Scenario = s)
+    }))
+  }
+
+  store_call <- function(f, action) {
+    tryCatch(store(f), error = function(e) {
+      showNotification(sprintf("Could not %s: %s", action, conditionMessage(e)), type = "error", duration = 10)
+      NULL
+    })
+  }
+
+  observeEvent(input$save_version, {
+    if (!has_data()) {
+      showNotification("Load data before saving a version.", type = "warning")
+      return()
+    }
+    name <- trimws(input$version_name)
+    if (!nzchar(name)) {
+      showNotification("Give the version a name.", type = "warning")
+      return()
+    }
+    base <- summarise_pnl(scenario_frames()$Base)
+    snapshot <- list(
+      source = state$source, clean = state$clean, issues = state$issues,
+      assumptions = state$assumptions, plan = state$plan, plan_name = state$plan_name,
+      settings = list(method = input$method, horizon = input$horizon, gst_mode = input$gst_mode, levers = levers()),
+      fy_summary = fy_summary()
+    )
+    id <- store_call(function(con) {
+      version_save(con, snapshot, name, input$version_notes, input$version_status, current_user,
+                   kpis = list(net_sales = base$Net_Sales, gm = base$GM, gm_pct = base$GM_Pct))
+    }, "save the version")
+    if (is.null(id)) return()
+    state$version <- list(id = id, name = name, status = input$version_status)
+    updateTextInput(session, "version_name", value = "")
+    updateTextAreaInput(session, "version_notes", value = "")
+    versions_rev(versions_rev() + 1)
+    showNotification(sprintf("Saved version '%s'.", name), type = "message")
+  })
+
+  versions <- reactive({
+    versions_rev()
+    invalidateLater(60000)  # pick up versions saved by other users
+    store_call(version_list, "list versions")
+  })
+  selected_ids <- reactive({
+    v <- versions()
+    if (is.null(v)) character(0) else v$id[input$versions_table_rows_selected]
+  })
+
+  version_badge <- function(status) {
+    cls <- c(Draft = "bg-secondary", "In review" = "bg-info", Approved = "bg-success", Archived = "bg-light text-dark border")
+    sprintf('<span class="badge %s">%s</span>', cls[status], status)
+  }
+
+  output$versions_table <- renderDT({
+    v <- versions()
+    validate(need(!is.null(v) && nrow(v) > 0, "No saved versions yet. Save the current plan to start a history."))
+    disp <- data.frame(
+      Name = v$name,
+      Status = version_badge(v$status),
+      Saved = format_local_time(v$created_at),
+      By = v$created_by,
+      Method = method_label(v$method),
+      Horizon = ifelse(is.na(v$horizon), "–", paste("to", fy_label(as.Date(v$horizon)))),
+      "Net sales (Base)" = fmt_compact(v$net_sales),
+      "GM (Base)" = fmt_compact(v$gm),
+      "GM %" = fmt_pct(v$gm_pct),
+      Notes = v$notes,
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+    DT::datatable(disp, rownames = FALSE, selection = "multiple", class = "compact hover",
+                  escape = setdiff(names(disp), "Status"),
+                  options = list(dom = "tip", pageLength = 10, ordering = FALSE, scrollX = TRUE))
+  })
+
+  # Snapshots never change, so decoded payloads can be cached for the session.
+  version_cache <- new.env()
+  get_version <- function(id) {
+    if (!exists(id, envir = version_cache, inherits = FALSE)) {
+      s <- store_call(function(con) version_get(con, id), "load the version")
+      if (is.null(s)) return(NULL)
+      assign(id, s, envir = version_cache)
+    }
+    get(id, envir = version_cache)
+  }
+
+  observeEvent(input$load_version, {
+    ids <- selected_ids()
+    if (length(ids) != 1) {
+      showNotification("Select exactly one version to load.", type = "warning")
+      return()
+    }
+    s <- get_version(ids)
+    req(s)
+    for (id in c("method", "gst_mode")) freezeReactiveValue(input, id)
+    updateSelectInput(session, "method", selected = s$settings$method)
+    updateSelectInput(session, "gst_mode", selected = s$settings$gst_mode)
+    apply_dataset(s$clean, s$issues, s$source, gst_mode = s$settings$gst_mode, horizon = s$settings$horizon)
+    state$assumptions <- s$assumptions
+    state$assumptions_rev <- state$assumptions_rev + 1
+    state$plan <- s$plan
+    state$plan_name <- s$plan_name
+    set_lever_inputs(s$settings$levers)
+    state$version <- list(id = s$id, name = s$name, status = versions()$status[versions()$id == s$id])
+    nav_select("main_nav", "overview")
+    showNotification(sprintf("Loaded version '%s'.", s$name), type = "message")
+  })
+
+  observeEvent(input$apply_status, {
+    ids <- selected_ids()
+    if (!length(ids)) {
+      showNotification("Select at least one version.", type = "warning")
+      return()
+    }
+    done <- store_call(function(con) {
+      for (id in ids) version_set_status(con, id, input$new_status, current_user)
+      TRUE
+    }, "update the status")
+    if (is.null(done)) return()
+    if (!is.null(state$version) && state$version$id %in% ids) {
+      v <- state$version
+      v$status <- input$new_status
+      state$version <- v
+    }
+    versions_rev(versions_rev() + 1)
+  })
+
+  pending_delete <- reactiveVal(character(0))
+  observeEvent(input$delete_version, {
+    v <- versions()
+    sel <- v[v$id %in% selected_ids(), , drop = FALSE]
+    if (!nrow(sel)) {
+      showNotification("Select at least one version.", type = "warning")
+      return()
+    }
+    if (any(sel$status == "Approved")) {
+      showNotification("Approved versions are locked. Change their status before deleting.", type = "warning")
+      return()
+    }
+    pending_delete(sel$id)
+    showModal(modalDialog(
+      title = "Delete saved versions?",
+      p(sprintf("This permanently deletes %d version(s):", nrow(sel))),
+      tags$ul(lapply(sel$name, tags$li)),
+      footer = tagList(modalButton("Cancel"), actionButton("confirm_delete", "Delete", class = "btn-danger"))
+    ))
+  })
+  observeEvent(input$confirm_delete, {
+    removeModal()
+    ids <- pending_delete()
+    done <- store_call(function(con) {
+      for (id in ids) version_delete(con, id)
+      TRUE
+    }, "delete")
+    if (is.null(done)) return()
+    if (!is.null(state$version) && state$version$id %in% ids) state$version <- NULL
+    pending_delete(character(0))
+    versions_rev(versions_rev() + 1)
+    showNotification(sprintf("Deleted %d version(s).", length(ids)), type = "message")
+  })
+
+  compare_data <- reactive({
+    ids <- selected_ids()
+    req(length(ids) >= 2)
+    v <- versions()
+    labels <- v$name[match(ids, v$id)]
+    dup <- duplicated(labels) | duplicated(labels, fromLast = TRUE)
+    labels[dup] <- paste0(labels[dup], " (", format_local_time(v$created_at[match(ids, v$id)][dup]), ")")
+    bind_rows(lapply(seq_along(ids), function(i) {
+      s <- get_version(ids[i])
+      if (is.null(s)) return(NULL)
+      s$fy_summary %>% filter(Scenario == "Base") %>% mutate(Version = labels[i])
+    })) %>%
+      mutate(Version = factor(Version, levels = labels), FY = fy_label(Period))
+  })
+
+  output$version_compare <- renderUI({
+    if (length(selected_ids()) < 2) return(NULL)
+    card(
+      card_header("Version comparison", tags$small(class = "text-muted ms-2", "whole portfolio, Base scenario, by fiscal year")),
+      card_body(
+        radioButtons("compare_metric", NULL, c("Net sales" = "Net_Sales", "Gross margin" = "GM"), inline = TRUE),
+        layout_columns(col_widths = c(7, 5),
+                       plotlyOutput("compare_chart", height = "340px"),
+                       DTOutput("compare_table", fill = FALSE))
+      )
+    )
+  })
+
+  output$compare_chart <- renderPlotly({
+    d <- compare_data()
+    metric <- input$compare_metric %||% "Net_Sales"
+    u <- unit_div()
+    cols <- stats::setNames(c(SERIES, rep(INK$muted, 99))[seq_along(levels(d$Version))], levels(d$Version))
+    plot_ly(d, x = ~FY, y = d[[metric]] / u, color = ~Version, colors = cols, type = "bar",
+            hovertemplate = paste0("%{fullData.name}: ", INR, "%{y:,.2f} ", UNIT_SHORT[[input$unit]], "<extra></extra>")) %>%
+      style_plot(y_title = unit_label(), x_type = "category") %>%
+      layout(barmode = "group")
+  })
+
+  output$compare_table <- renderDT({
+    d <- compare_data()
+    metric <- input$compare_metric %||% "Net_Sales"
+    wide <- d %>%
+      select(FY, Version, value = all_of(metric)) %>%
+      mutate(value = fmt_indian(value / unit_div(), unit_digits())) %>%
+      tidyr::pivot_wider(names_from = Version, values_from = value)
+    DT::datatable(wide, rownames = FALSE, class = "compact nowrap",
+                  options = list(dom = "t", ordering = FALSE, paging = FALSE,
+                                 columnDefs = list(list(targets = seq_len(ncol(wide) - 1), className = "dt-right"))))
   })
 
   # ---- Board pack ----------------------------------------------------------------------------

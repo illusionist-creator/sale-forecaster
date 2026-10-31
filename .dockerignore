@@ -1,0 +1,9 @@
+.git
+.github
+.env
+data
+backups
+rsconnect
+tests
+deploy
+*.md
